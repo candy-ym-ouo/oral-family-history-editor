@@ -26,6 +26,24 @@ enum ChapterStatus {
   PUBLISHED
 }
 
+enum ConsentScope {
+  TRANSCRIPT
+  FAMILY
+  PUBLIC
+}
+
+enum ConsentStatus {
+  ACTIVE
+  EXPIRED
+  WITHDRAWN
+}
+
+enum ConsentAuditAction {
+  CREATED
+  UPDATED
+  WITHDRAWN
+}
+
 model User {
   id                String               @id @default(uuid())
   email             String               @unique
@@ -57,6 +75,7 @@ model Workspace {
   clips      Clip[]
   chapters   Chapter[]
   events     CollaborationEvent[]
+  consents   InterviewConsent[]
 
   @@index([ownerId])
 }
@@ -92,6 +111,7 @@ model Recording {
   workspace       Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   createdBy       User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
   clips           Clip[]
+  consentLinks    ConsentRecording[]
 
   @@index([workspaceId, updatedAt])
   @@index([createdById])
@@ -145,6 +165,8 @@ model Chapter {
   title       String
   intro       String        @default("")
   status      ChapterStatus @default(DRAFT)
+  // 目标发布范围，发布时必须被授权 scope 覆盖（FAMILY <= PUBLIC）
+  audience    ConsentScope  @default(FAMILY)
   version     Int           @default(1)
   createdById String
   updatedAt   DateTime      @updatedAt
@@ -169,6 +191,63 @@ model ChapterBlock {
 
   @@index([chapterId, position])
   @@index([clipId])
+}
+
+// 访谈授权登记：记录受访人授权范围、期限与签署凭证；撤回仅追加记录，不删除本行（法定留痕）
+model InterviewConsent {
+  id              String                  @id @default(uuid())
+  workspaceId     String
+  intervieweeName String
+  contactInfo     String                  @default("")
+  scope           ConsentScope
+  startAt         DateTime
+  endAt           DateTime?
+  agreementText   String                  @default("")
+  signature       String                  @default("")
+  evidenceRef     String                  @default("")
+  notes           String                  @default("")
+  status          ConsentStatus           @default(ACTIVE)
+  version         Int                     @default(1)
+  createdById     String
+  withdrawnAt     DateTime?
+  withdrawnById   String?
+  withdrawReason  String?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+  workspace       Workspace               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  recordings      ConsentRecording[]
+  auditLogs       ConsentAuditLog[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, intervieweeName])
+  @@index([createdById])
+}
+
+// 授权覆盖的访谈录音（多对多）
+model ConsentRecording {
+  consentId   String
+  recordingId String
+  createdAt   DateTime @default(now())
+  consent     InterviewConsent @relation(fields: [consentId], references: [id], onDelete: Cascade)
+  recording   Recording        @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+
+  @@id([consentId, recordingId])
+  @@index([recordingId])
+}
+
+// 授权操作审计：仅追加（CREATED/UPDATED/WITHDRAWN），任何接口都不提供修改或删除
+model ConsentAuditLog {
+  id          String              @id @default(uuid())
+  consentId   String
+  workspaceId String
+  action      ConsentAuditAction
+  actorId     String
+  snapshotJson Json
+  createdAt    DateTime            @default(now())
+  consent      InterviewConsent    @relation(fields: [consentId], references: [id], onDelete: Cascade)
+
+  @@index([consentId, createdAt])
+  @@index([workspaceId, createdAt])
 }
 
 model CollaborationEvent {

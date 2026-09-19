@@ -22,7 +22,16 @@ import {
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
+  consentCreateSchema,
+  consentUpdateSchema,
+  consentWithdrawSchema,
+  CONSENT_SCOPE_RANK,
 } from '@history/contracts';
+import {
+  assessChapterRisk,
+  listWorkspaceConsents,
+  serializeConsent,
+} from './consent.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
@@ -78,7 +87,7 @@ const storage = path.isAbsolute(configuredStorage)
 await mkdir(storage, { recursive: true });
 
 const prisma = new PrismaClient();
-const app = Fastify({ logger: true });
+export const app = Fastify({ logger: true });
 const port = Number(process.env.PORT || 4000);
 const webOrigins = (process.env.WEB_ORIGIN || process.env.APP_ORIGIN || 'http://localhost:5173')
   .split(',')
@@ -483,10 +492,32 @@ app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (re
     where: { workspaceId },
     include: {
       _count: { select: { clips: { where: { deletedAt: null } } } },
+      consentLinks: { include: { consent: true } },
     },
     orderBy: { createdAt: 'desc' },
   });
-  return { data: rows.map(recordingDto) };
+  // 每段访谈当前可用授权的最高范围（未撤回且在期限内），供前端标记未授权访谈
+  const now = new Date();
+  return {
+    data: rows.map(({ consentLinks, ...recording }) => {
+      const activeScopes = consentLinks
+        .map((link) => link.consent)
+        .filter((consent) => {
+          if (consent.status === 'WITHDRAWN') return false;
+          return !consent.endAt || consent.endAt.getTime() > now.getTime();
+        })
+        .map((consent) => CONSENT_SCOPE_RANK[consent.scope as keyof typeof CONSENT_SCOPE_RANK]);
+      const maxRank = activeScopes.length ? Math.max(...activeScopes) : 0;
+      return {
+        ...recordingDto(recording),
+        consent: {
+          activeCount: activeScopes.length,
+          maxScope:
+            maxRank >= 3 ? 'PUBLIC' : maxRank === 2 ? 'FAMILY' : maxRank === 1 ? 'TRANSCRIPT' : null,
+        },
+      };
+    }),
+  };
 });
 
 app.get('/v1/recordings/:id/file', async (req, reply) => {
@@ -697,17 +728,23 @@ app.patch('/v1/clips/:id', { preHandler: authenticate }, async (req, reply) => {
 app.get('/v1/workspaces/:id/chapters', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
   await requireMembership(req, workspaceId);
-  return {
-    data: await prisma.chapter.findMany({
-      where: { workspaceId },
-      include: {
-        blocks: {
-          orderBy: { position: 'asc' },
-          include: { clip: { where: { deletedAt: null } } },
-        },
+  const chapters = await prisma.chapter.findMany({
+    where: { workspaceId },
+    include: {
+      blocks: {
+        orderBy: { position: 'asc' },
+        include: { clip: { where: { deletedAt: null } } },
       },
-      orderBy: { updatedAt: 'desc' },
-    }),
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+  // 已发布章节同样评估：撤回/过期只提示风险，历史内容按法定留痕保留
+  const consents = await listWorkspaceConsents(prisma, workspaceId);
+  return {
+    data: chapters.map((chapter) => ({
+      ...chapter,
+      consentRisk: assessChapterRisk(chapter, consents),
+    })),
   };
 });
 
@@ -723,6 +760,7 @@ app.post('/v1/workspaces/:id/chapters', { preHandler: authenticate }, async (req
         workspaceId,
         title: body.title,
         intro: body.intro,
+        audience: body.audience,
         createdById: user.id,
       },
     });
@@ -746,6 +784,7 @@ app.patch('/v1/chapters/:id', { preHandler: authenticate }, async (req, reply) =
       data: {
         title: body.title ?? old.title,
         intro: body.intro ?? old.intro,
+        audience: body.audience ?? old.audience,
         version: { increment: 1 },
       },
     });
@@ -859,6 +898,19 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
     );
   }
 
+  // 授权硬门槛：被引用访谈必须存在覆盖目标发布范围、且在有效期内未撤回的授权
+  const consents = await listWorkspaceConsents(prisma, chapter.workspaceId);
+  const risk = assessChapterRisk(chapter, consents);
+  if (risk.level === 'BLOCKED') {
+    throw new HttpError(
+      403,
+      'CONSENT_PUBLISH_BLOCKED',
+      '访谈授权校验未通过，禁止发布：' +
+        risk.issues.map((issue) => issue.message).join('；'),
+      { issues: risk.issues, audience: chapter.audience },
+    );
+  }
+
   const user = authUser(req);
   const published = await prisma.$transaction(async (tx) => {
     const updated = await tx.chapter.update({
@@ -877,6 +929,274 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
     return updated;
   });
   return { data: published };
+});
+
+// ---------------------------------------------------------------------------
+// 访谈授权登记：授权范围、期限、撤回（仅追加留痕，不提供删除接口）
+// ---------------------------------------------------------------------------
+
+async function assertRecordingsInWorkspace(
+  workspaceId: string,
+  recordingIds: string[],
+): Promise<void> {
+  if (recordingIds.length === 0) return;
+  const count = await prisma.recording.count({
+    where: { workspaceId, id: { in: recordingIds } },
+  });
+  if (count !== new Set(recordingIds).size) {
+    throw new HttpError(400, 'INVALID_RECORDING', '关联访谈录音不属于当前工作区');
+  }
+}
+
+async function writeConsentAudit(
+  tx: Prisma.TransactionClient,
+  consent: {
+    id: string;
+    workspaceId: string;
+  },
+  action: 'CREATED' | 'UPDATED' | 'WITHDRAWN',
+  actorId: string,
+) {
+  const snapshot = await tx.interviewConsent.findUniqueOrThrow({
+    where: { id: consent.id },
+    include: { recordings: true },
+  });
+  await tx.consentAuditLog.create({
+    data: {
+      consentId: consent.id,
+      workspaceId: consent.workspaceId,
+      action,
+      actorId,
+      snapshotJson: snapshot as unknown as Prisma.InputJsonValue,
+    },
+  });
+}
+
+app.get('/v1/workspaces/:id/consents', { preHandler: authenticate }, async (req) => {
+  const workspaceId = (req.params as { id: string }).id;
+  await requireMembership(req, workspaceId);
+  const rows = await listWorkspaceConsents(prisma, workspaceId);
+  return { data: rows.map((row) => serializeConsent(row)) };
+});
+
+app.post('/v1/workspaces/:id/consents', { preHandler: authenticate }, async (req, reply) => {
+  const workspaceId = (req.params as { id: string }).id;
+  await requireMembership(req, workspaceId, [Role.OWNER, Role.EDITOR]);
+  const body = validationError(consentCreateSchema, req.body);
+  const recordingIds: string[] = body.recordingIds ?? [];
+  await assertRecordingsInWorkspace(workspaceId, recordingIds);
+
+  const startAt = new Date(body.startAt);
+  const endAt = body.endAt ? new Date(body.endAt) : null;
+  const user = authUser(req);
+
+  const consent = await prisma.$transaction(async (tx) => {
+    const created = await tx.interviewConsent.create({
+      data: {
+        workspaceId,
+        intervieweeName: body.intervieweeName,
+        contactInfo: body.contactInfo,
+        scope: body.scope,
+        startAt,
+        endAt,
+        agreementText: body.agreementText,
+        signature: body.signature,
+        evidenceRef: body.evidenceRef,
+        notes: body.notes,
+        createdById: user.id,
+        recordings: {
+          create: recordingIds.map((recordingId) => ({ recordingId })),
+        },
+      },
+      include: { recordings: true },
+    });
+    await writeConsentAudit(tx, created, 'CREATED', user.id);
+    await recordEvent(
+      tx,
+      workspaceId,
+      user.id,
+      'consent',
+      created.id,
+      'created',
+      {
+        intervieweeName: created.intervieweeName,
+        scope: created.scope,
+        startAt: created.startAt,
+        endAt: created.endAt,
+        recordingIds,
+      },
+    );
+    return created;
+  });
+
+  return reply.code(201).send({ data: serializeConsent(consent) });
+});
+
+app.patch('/v1/consents/:id', { preHandler: authenticate }, async (req, reply) => {
+  const consentId = (req.params as { id: string }).id;
+  const old = await prisma.interviewConsent.findUnique({
+    where: { id: consentId },
+    include: { recordings: true },
+  });
+  if (!old) throw new HttpError(404, 'NOT_FOUND', '授权登记不存在');
+  await requireMembership(req, old.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+  if (old.status === 'WITHDRAWN') {
+    throw new HttpError(
+      409,
+      'CONSENT_WITHDRAWN_IMMUTABLE',
+      '授权已撤回，不能修改；请重新登记一份授权',
+    );
+  }
+
+  const body = validationError(consentUpdateSchema, req.body);
+  if (body.recordingIds) {
+    await assertRecordingsInWorkspace(old.workspaceId, body.recordingIds);
+  }
+
+  const startAt = body.startAt ? new Date(body.startAt) : old.startAt;
+  const endAt =
+    body.endAt === undefined
+      ? old.endAt
+      : body.endAt === null
+        ? null
+        : new Date(body.endAt);
+  if (endAt && endAt.getTime() <= startAt.getTime()) {
+    throw new HttpError(400, 'INVALID_INPUT', '授权结束时间必须晚于开始时间');
+  }
+
+  const user = authUser(req);
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.interviewConsent.updateMany({
+      where: { id: old.id, version: body.version, status: 'ACTIVE' },
+      data: {
+        scope: body.scope ?? old.scope,
+        startAt,
+        endAt,
+        agreementText: body.agreementText ?? old.agreementText,
+        signature: body.signature ?? old.signature,
+        evidenceRef: body.evidenceRef ?? old.evidenceRef,
+        notes: body.notes ?? old.notes,
+        version: { increment: 1 },
+      },
+    });
+    if (result.count === 0) return null;
+
+    if (body.recordingIds) {
+      await tx.consentRecording.deleteMany({ where: { consentId: old.id } });
+      if (body.recordingIds.length > 0) {
+        await tx.consentRecording.createMany({
+          data: body.recordingIds.map((recordingId) => ({
+            consentId: old.id,
+            recordingId,
+          })),
+        });
+      }
+    }
+
+    const current = await tx.interviewConsent.findUniqueOrThrow({
+      where: { id: old.id },
+      include: { recordings: true },
+    });
+    await writeConsentAudit(tx, current, 'UPDATED', user.id);
+    await recordEvent(
+      tx,
+      old.workspaceId,
+      user.id,
+      'consent',
+      current.id,
+      'updated',
+      {
+        scope: current.scope,
+        startAt: current.startAt,
+        endAt: current.endAt,
+        recordingIds: current.recordings.map((link) => link.recordingId),
+      },
+    );
+    return current;
+  });
+
+  if (!updated) {
+    const server = await prisma.interviewConsent.findUnique({
+      where: { id: old.id },
+      include: { recordings: true },
+    });
+    return reply.code(409).send({
+      error: {
+        code: 'CONSENT_VERSION_CONFLICT',
+        message: '授权登记已被其他成员修改或已撤回',
+        details: { server: server ? serializeConsent(server) : null },
+      },
+    });
+  }
+
+  return { data: serializeConsent(updated) };
+});
+
+// 撤回授权：状态置为 WITHDRAWN 并记录原因/操作人/时间；登记与审计均保留（法定留痕）
+app.post('/v1/consents/:id/withdraw', { preHandler: authenticate }, async (req, reply) => {
+  const consentId = (req.params as { id: string }).id;
+  const old = await prisma.interviewConsent.findUnique({ where: { id: consentId } });
+  if (!old) throw new HttpError(404, 'NOT_FOUND', '授权登记不存在');
+  await requireMembership(req, old.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+  const body = validationError(consentWithdrawSchema, req.body);
+
+  if (old.status === 'WITHDRAWN') {
+    throw new HttpError(409, 'CONSENT_ALREADY_WITHDRAWN', '该授权已撤回，撤回不可撤销');
+  }
+
+  const user = authUser(req);
+  const withdrawnAt = new Date();
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.interviewConsent.updateMany({
+      where: { id: old.id, status: 'ACTIVE' },
+      data: {
+        status: 'WITHDRAWN',
+        withdrawnAt,
+        withdrawnById: user.id,
+        withdrawReason: body.reason,
+        version: { increment: 1 },
+      },
+    });
+    if (result.count === 0) return null;
+
+    const current = await tx.interviewConsent.findUniqueOrThrow({
+      where: { id: old.id },
+      include: { recordings: true },
+    });
+    await writeConsentAudit(tx, current, 'WITHDRAWN', user.id);
+    await recordEvent(
+      tx,
+      old.workspaceId,
+      user.id,
+      'consent',
+      current.id,
+      'withdrawn',
+      { withdrawnAt, reason: body.reason },
+    );
+    return current;
+  });
+
+  if (!updated) {
+    throw new HttpError(409, 'CONSENT_ALREADY_WITHDRAWN', '该授权已撤回，撤回不可撤销');
+  }
+
+  return reply.code(200).send({ data: serializeConsent(updated) });
+});
+
+// 授权操作审计（仅追加留痕，只读）
+app.get('/v1/consents/:id/audit-log', { preHandler: authenticate }, async (req) => {
+  const consentId = (req.params as { id: string }).id;
+  const consent = await prisma.interviewConsent.findUnique({ where: { id: consentId } });
+  if (!consent) throw new HttpError(404, 'NOT_FOUND', '授权登记不存在');
+  await requireMembership(req, consent.workspaceId);
+
+  const logs = await prisma.consentAuditLog.findMany({
+    where: { consentId },
+    orderBy: { createdAt: 'asc' },
+  });
+  return { data: logs };
 });
 
 app.get('/v1/workspaces/:id/events', { preHandler: authenticate }, async (req) => {
