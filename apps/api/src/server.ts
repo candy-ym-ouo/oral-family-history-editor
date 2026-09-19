@@ -4,7 +4,7 @@ import cookie from '@fastify/cookie';
 import jwt from '@fastify/jwt';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
-import { Prisma, PrismaClient, Role } from '@prisma/client';
+import { Prisma, PrismaClient, RecordingConsentEventType, RecordingConsentStatus, Role } from '@prisma/client';
 import argon2 from 'argon2';
 import { createReadStream } from 'node:fs';
 import { createWriteStream } from 'node:fs';
@@ -22,7 +22,18 @@ import {
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
+  consentChannelSchema,
+  consentCreateSchema,
+  consentUpdateSchema,
+  consentWithdrawSchema,
+  type ConsentChannel,
 } from '@history/contracts';
+import {
+  consentState,
+  evaluateChapterRisk,
+  toDateText,
+  type ConsentSnapshot,
+} from './consent.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
@@ -172,6 +183,66 @@ async function recordEvent(
 
 function recordingDto<T extends { sizeBytes: bigint }>(recording: T) {
   return { ...recording, sizeBytes: recording.sizeBytes.toString() };
+}
+
+/** 将 YYYY-MM-DD 文本转为 UTC 当天起点，避免受服务器时区影响 */
+function toUtcDate(value: string): Date {
+  return new Date(`${value}T00:00:00.000Z`);
+}
+
+function consentDto(
+  consent: {
+    id: string;
+    intervieweeName: string;
+    intervieweeContact: string;
+    grantedAt: Date;
+    expiresOn: Date | null;
+    scopeJson: Prisma.JsonValue;
+    notes: string;
+    status: RecordingConsentStatus;
+    withdrawnAt: Date | null;
+    withdrawReason: string | null;
+    version: number;
+    createdById: string;
+    createdAt: Date;
+    updatedAt: Date;
+  },
+  now: Date,
+) {
+  return {
+    ...consent,
+    grantedAt: toDateText(consent.grantedAt),
+    expiresOn: consent.expiresOn ? toDateText(consent.expiresOn) : null,
+    state: consentState(consent, now),
+  };
+}
+
+/** 批量取一组录音的最新授权记录（同一录音存在多条时取最新一条） */
+async function findLatestConsentsByRecording(
+  recordingIds: string[],
+): Promise<Map<string, ConsentSnapshot>> {
+  const ids = [...new Set(recordingIds)];
+  if (ids.length === 0) return new Map();
+
+  const rows = await prisma.recordingConsent.findMany({
+    where: { recordingId: { in: ids } },
+    orderBy: { createdAt: 'desc' },
+  });
+  const map = new Map<string, ConsentSnapshot>();
+  for (const row of rows) {
+    if (!map.has(row.recordingId)) {
+      map.set(row.recordingId, {
+        id: row.id,
+        intervieweeName: row.intervieweeName,
+        status: row.status,
+        grantedAt: row.grantedAt,
+        expiresOn: row.expiresOn,
+        withdrawnAt: row.withdrawnAt,
+        scopeJson: row.scopeJson,
+      });
+    }
+  }
+  return map;
 }
 
 function parseByteRange(header: string, size: number): { start: number; end: number } | null {
@@ -483,10 +554,23 @@ app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (re
     where: { workspaceId },
     include: {
       _count: { select: { clips: { where: { deletedAt: null } } } },
+      consents: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
     orderBy: { createdAt: 'desc' },
   });
-  return { data: rows.map(recordingDto) };
+  const now = new Date();
+  return {
+    data: rows.map(({ consents, ...recording }) => ({
+      ...recordingDto(recording),
+      latestConsent: consents[0]
+        ? {
+            id: consents[0].id,
+            intervieweeName: consents[0].intervieweeName,
+            state: consentState(consents[0], now),
+          }
+        : null,
+    })),
+  };
 });
 
 app.get('/v1/recordings/:id/file', async (req, reply) => {
@@ -694,21 +778,267 @@ app.patch('/v1/clips/:id', { preHandler: authenticate }, async (req, reply) => {
   return { data: updated };
 });
 
+app.get(
+  '/v1/recordings/:id/consents',
+  { preHandler: authenticate },
+  async (req) => {
+    const recordingId = (req.params as { id: string }).id;
+    const recording = await prisma.recording.findUnique({ where: { id: recordingId } });
+    if (!recording) {
+      throw new HttpError(404, 'NOT_FOUND', '录音不存在');
+    }
+    await requireMembership(req, recording.workspaceId);
+
+    const consents = await prisma.recordingConsent.findMany({
+      where: { recordingId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const now = new Date();
+    return { data: consents.map((consent) => consentDto(consent, now)) };
+  },
+);
+
+app.post(
+  '/v1/recordings/:id/consents',
+  { preHandler: authenticate },
+  async (req, reply) => {
+    const recordingId = (req.params as { id: string }).id;
+    const recording = await prisma.recording.findUnique({ where: { id: recordingId } });
+    if (!recording) {
+      throw new HttpError(404, 'NOT_FOUND', '录音不存在');
+    }
+    await requireMembership(req, recording.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+    const body = validationError(consentCreateSchema, req.body);
+    const user = authUser(req);
+
+    const created = await prisma.$transaction(async (tx) => {
+      const consent = await tx.recordingConsent.create({
+        data: {
+          workspaceId: recording.workspaceId,
+          recordingId: recording.id,
+          intervieweeName: body.intervieweeName,
+          intervieweeContact: body.intervieweeContact,
+          grantedAt: toUtcDate(body.grantedAt),
+          expiresOn: body.expiresOn ? toUtcDate(body.expiresOn) : null,
+          scopeJson: body.scope as Prisma.InputJsonValue,
+          notes: body.notes,
+          createdById: user.id,
+        },
+      });
+      await tx.recordingConsentEvent.create({
+        data: {
+          workspaceId: recording.workspaceId,
+          consentId: consent.id,
+          recordingId: recording.id,
+          actorId: user.id,
+          type: RecordingConsentEventType.GRANTED,
+          detailJson: { consent } as Prisma.InputJsonValue,
+        },
+      });
+      return consent;
+    });
+
+    return reply.code(201).send({ data: consentDto(created, new Date()) });
+  },
+);
+
+app.patch('/v1/consents/:id', { preHandler: authenticate }, async (req, reply) => {
+  const consentId = (req.params as { id: string }).id;
+  const old = await prisma.recordingConsent.findUnique({ where: { id: consentId } });
+  if (!old) throw new HttpError(404, 'NOT_FOUND', '授权记录不存在');
+  await requireMembership(req, old.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+  if (old.status === RecordingConsentStatus.WITHDRAWN) {
+    throw new HttpError(
+      409,
+      'CONSENT_WITHDRAWN',
+      '授权已撤回，记录不可修改；如需重新授权请新建登记',
+    );
+  }
+
+  const body = validationError(consentUpdateSchema, req.body);
+  const grantedAt = body.grantedAt ? toUtcDate(body.grantedAt) : old.grantedAt;
+  const expiresOn =
+    body.expiresOn === undefined
+      ? old.expiresOn
+      : body.expiresOn
+        ? toUtcDate(body.expiresOn)
+        : null;
+  if (expiresOn && expiresOn < grantedAt) {
+    throw new HttpError(400, 'INVALID_INPUT', '授权到期日不能早于授权日', {
+      fieldErrors: { expiresOn: ['授权到期日不能早于授权日'] },
+    });
+  }
+
+  const scopeJson = (body.scope ?? old.scopeJson) as Prisma.JsonObject;
+  const user = authUser(req);
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.recordingConsent.updateMany({
+      where: { id: old.id, version: body.version, status: RecordingConsentStatus.ACTIVE },
+      data: {
+        intervieweeName: body.intervieweeName ?? old.intervieweeName,
+        intervieweeContact: body.intervieweeContact ?? old.intervieweeContact,
+        grantedAt,
+        expiresOn,
+        scopeJson: scopeJson as Prisma.InputJsonValue,
+        notes: body.notes ?? old.notes,
+        version: { increment: 1 },
+      },
+    });
+    if (result.count === 0) return null;
+
+    const current = await tx.recordingConsent.findUniqueOrThrow({ where: { id: old.id } });
+    await tx.recordingConsentEvent.create({
+      data: {
+        workspaceId: old.workspaceId,
+        consentId: current.id,
+        recordingId: current.recordingId,
+        actorId: user.id,
+        type: RecordingConsentEventType.UPDATED,
+        detailJson: { from: old, to: current } as Prisma.InputJsonValue,
+      },
+    });
+    return current;
+  });
+
+  if (!updated) {
+    return reply.code(409).send({
+      error: {
+        code: 'CONSENT_VERSION_CONFLICT',
+        message: '授权记录已被其他成员修改或已撤回',
+      },
+    });
+  }
+  return { data: consentDto(updated, new Date()) };
+});
+
+app.post(
+  '/v1/consents/:id/withdraw',
+  { preHandler: authenticate },
+  async (req, reply) => {
+    const consentId = (req.params as { id: string }).id;
+    const old = await prisma.recordingConsent.findUnique({ where: { id: consentId } });
+    if (!old) throw new HttpError(404, 'NOT_FOUND', '授权记录不存在');
+    await requireMembership(req, old.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+    if (old.status === RecordingConsentStatus.WITHDRAWN) {
+      throw new HttpError(409, 'CONSENT_WITHDRAWN', '授权已撤回，请勿重复操作');
+    }
+
+    const body = validationError(consentWithdrawSchema, req.body);
+    const user = authUser(req);
+    const withdrawnAt = new Date();
+    const withdrawn = await prisma.$transaction(async (tx) => {
+      const current = await tx.recordingConsent.update({
+        where: { id: old.id },
+        data: {
+          status: RecordingConsentStatus.WITHDRAWN,
+          withdrawnAt,
+          withdrawReason: body.reason,
+          withdrawnById: user.id,
+        },
+      });
+      // 撤回只追加事件、不删除任何历史内容，满足法定留痕要求
+      await tx.recordingConsentEvent.create({
+        data: {
+          workspaceId: old.workspaceId,
+          consentId: current.id,
+          recordingId: current.recordingId,
+          actorId: user.id,
+          type: RecordingConsentEventType.WITHDRAWN,
+          detailJson: {
+            reason: body.reason,
+            withdrawnAt: withdrawnAt.toISOString(),
+          } as Prisma.InputJsonValue,
+        },
+      });
+      await recordEvent(
+        tx,
+        old.workspaceId,
+        user.id,
+        'recordingConsent',
+        current.id,
+        'withdrawn',
+        { recordingId: current.recordingId, reason: body.reason },
+      );
+      return current;
+    });
+
+    return reply.code(201).send({ data: consentDto(withdrawn, new Date()) });
+  },
+);
+
+app.get('/v1/consents/:id/events', { preHandler: authenticate }, async (req) => {
+  const consentId = (req.params as { id: string }).id;
+  const consent = await prisma.recordingConsent.findUnique({ where: { id: consentId } });
+  if (!consent) throw new HttpError(404, 'NOT_FOUND', '授权记录不存在');
+  await requireMembership(req, consent.workspaceId);
+
+  const events = await prisma.recordingConsentEvent.findMany({
+    where: { consentId },
+    orderBy: { createdAt: 'asc' },
+  });
+  return { data: events };
+});
+
 app.get('/v1/workspaces/:id/chapters', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
   await requireMembership(req, workspaceId);
-  return {
-    data: await prisma.chapter.findMany({
-      where: { workspaceId },
-      include: {
-        blocks: {
-          orderBy: { position: 'asc' },
-          include: { clip: { where: { deletedAt: null } } },
-        },
+  const chapters = await prisma.chapter.findMany({
+    where: { workspaceId },
+    include: {
+      blocks: {
+        orderBy: { position: 'asc' },
+        include: { clip: { where: { deletedAt: null } } },
       },
-      orderBy: { updatedAt: 'desc' },
-    }),
-  };
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+  const recordingIds = [
+    ...new Set(
+      chapters.flatMap((chapter) =>
+        chapter.blocks
+          .filter((block) => block.clip?.recordingId)
+          .map((block) => block.clip!.recordingId),
+      ),
+    ),
+  ];
+  const consentsByRecording = await findLatestConsentsByRecording(recordingIds);
+  const recordingTitleById = new Map<string, string>();
+  if (recordingIds.length > 0) {
+    const recordings = await prisma.recording.findMany({
+      where: { id: { in: recordingIds } },
+      select: { id: true, title: true },
+    });
+    for (const recording of recordings) {
+      recordingTitleById.set(recording.id, recording.title);
+    }
+  }
+
+  const now = new Date();
+  const data = chapters.map((chapter) => {
+    const items = [
+      ...new Map(
+        chapter.blocks
+          .filter((block) => block.clip)
+          .map((block) => [
+            block.clip!.recordingId,
+            {
+              recordingId: block.clip!.recordingId,
+              recordingTitle: recordingTitleById.get(block.clip!.recordingId) || '未命名录音',
+              consent: consentsByRecording.get(block.clip!.recordingId) ?? null,
+            },
+          ]),
+      ).values(),
+    ];
+    return {
+      ...chapter,
+      consentRisk: evaluateChapterRisk(items, { now }),
+    };
+  });
+  return { data };
 });
 
 app.post('/v1/workspaces/:id/chapters', { preHandler: authenticate }, async (req, reply) => {
@@ -824,13 +1154,24 @@ app.post('/v1/chapters/:id/blocks', { preHandler: authenticate }, async (req, re
 
 app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, reply) => {
   const chapterId = (req.params as { id: string }).id;
+  const publishBody = z
+    .object({
+      channel: consentChannelSchema.optional(),
+    })
+    .strict()
+    .safeParse(req.body ?? {});
+  if (!publishBody.success) {
+    throw new HttpError(400, 'INVALID_INPUT', '发布参数不正确', publishBody.error.flatten());
+  }
+  const targetChannel: ConsentChannel | undefined = publishBody.data.channel;
+
   const chapter = await prisma.chapter.findUnique({
     where: { id: chapterId },
     include: {
       blocks: {
         include: {
           clip: {
-            include: { recording: { select: { status: true } } },
+            include: { recording: { select: { id: true, title: true, status: true } } },
           },
         },
       },
@@ -859,11 +1200,40 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
     );
   }
 
+  // 授权门禁：章节引用的每段录音都必须持有覆盖发布用途的有效授权。
+  // 撤回或到期授权会阻止发布，但历史章节与授权记录本身仍保留（法定留痕）。
+  const recordingMap = new Map(
+    chapter.blocks
+      .filter((block) => block.clip)
+      .map((block) => [block.clip!.recording.id, block.clip!.recording]),
+  );
+  const consentsByRecording = await findLatestConsentsByRecording([...recordingMap.keys()]);
+  const now = new Date();
+  const consentRisk = evaluateChapterRisk(
+    [...recordingMap.values()].map((recording) => ({
+      recordingId: recording.id,
+      recordingTitle: recording.title,
+      consent: consentsByRecording.get(recording.id) ?? null,
+    })),
+    { now, channel: targetChannel },
+  );
+  if (consentRisk.level === 'blocked') {
+    throw new HttpError(
+      403,
+      'CONSENT_PUBLISH_BLOCKED',
+      consentRisk.message,
+      { consentRisk },
+    );
+  }
+
   const user = authUser(req);
+  const wasPublished = chapter.status === 'PUBLISHED';
   const published = await prisma.$transaction(async (tx) => {
     const updated = await tx.chapter.update({
       where: { id: chapter.id },
-      data: { status: 'PUBLISHED', version: { increment: 1 } },
+      data: wasPublished
+        ? { status: 'PUBLISHED' }
+        : { status: 'PUBLISHED', version: { increment: 1 } },
     });
     await recordEvent(
       tx,
@@ -872,11 +1242,18 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
       'chapter',
       updated.id,
       'published',
-      updated,
+      { ...updated, channel: targetChannel ?? null, consentWarnings: consentRisk.recordings
+        .filter((risk) => risk.level === 'warning')
+        .map((risk) => ({ recordingId: risk.recordingId, message: risk.message })) },
     );
     return updated;
   });
-  return { data: published };
+  return {
+    data: {
+      chapter: published,
+      consentRisk,
+    },
+  };
 });
 
 app.get('/v1/workspaces/:id/events', { preHandler: authenticate }, async (req) => {

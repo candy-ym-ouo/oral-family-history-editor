@@ -29,6 +29,11 @@ type Recording = {
   status: 'UPLOADING' | 'PROCESSING' | 'READY' | 'FAILED';
   processingError?: string | null;
   _count?: { clips: number };
+  latestConsent?: {
+    id: string;
+    intervieweeName: string;
+    state: ConsentState;
+  } | null;
 };
 
 type Clip = {
@@ -39,6 +44,87 @@ type Clip = {
   summary: string;
   version: number;
 };
+
+type ConsentState = 'ACTIVE' | 'WITHDRAWN' | 'EXPIRED';
+
+type ConsentScope = {
+  usages: string[];
+  channels: string[];
+  attributionName?: string;
+  requiresAnonymization: boolean;
+  restrictions: string;
+};
+
+type Consent = {
+  id: string;
+  intervieweeName: string;
+  intervieweeContact: string;
+  grantedAt: string;
+  expiresOn: string | null;
+  scopeJson: ConsentScope;
+  notes: string;
+  status: 'ACTIVE' | 'WITHDRAWN';
+  state: ConsentState;
+  withdrawnAt: string | null;
+  withdrawReason: string | null;
+  version: number;
+};
+
+type ConsentEvent = {
+  id: string;
+  type: 'GRANTED' | 'UPDATED' | 'WITHDRAWN';
+  detailJson: unknown;
+  createdAt: string;
+};
+
+type ConsentRisk = {
+  level: 'ok' | 'warning' | 'blocked';
+  reasonCode: string;
+  message: string;
+  recordings: Array<{
+    recordingId: string;
+    recordingTitle: string;
+    level: 'ok' | 'warning' | 'blocked';
+    reasonCode: string;
+    message: string;
+  }>;
+};
+
+type ChapterBlock = {
+  id: string;
+  type: string;
+  clipId: string | null;
+};
+
+type Chapter = {
+  id: string;
+  title: string;
+  intro: string;
+  status: 'DRAFT' | 'PUBLISHED';
+  version: number;
+  blocks: ChapterBlock[];
+  updatedAt: string;
+  consentRisk: ConsentRisk;
+};
+
+const USAGE_LABELS: Record<string, string> = {
+  TRANSCRIPTION: '文字整理',
+  EDITING: '编辑成书',
+  PUBLICATION: '公开发表',
+  RESEARCH: '学术研究',
+  ARCHIVE: '归档保存',
+};
+
+const CHANNEL_LABELS: Record<string, string> = {
+  PRINT: '纸质出版',
+  WEB: '网络公开',
+  SOCIAL_MEDIA: '社交媒体',
+  BROADCAST: '音视频播出',
+  PRIVATE_CIRCLE: '家族内部',
+};
+
+const ALL_USAGES = Object.keys(USAGE_LABELS);
+const ALL_CHANNELS = Object.keys(CHANNEL_LABELS);
 
 type ApiErrorPayload = {
   error?: {
@@ -191,6 +277,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [view, setView] = useState<'recordings' | 'chapters'>('recordings');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -313,75 +400,104 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           <span className="mark small">家史</span>
           <strong>{workspace?.name || '口述家史'}</strong>
         </div>
-        <nav>
+        <nav className="topnav">
+          <button
+            type="button"
+            className={view === 'recordings' ? 'navtab active' : 'navtab'}
+            onClick={() => setView('recordings')}
+          >
+            录音与片段
+          </button>
+          <button
+            type="button"
+            className={view === 'chapters' ? 'navtab active' : 'navtab'}
+            onClick={() => setView('chapters')}
+          >
+            章节与发布
+          </button>
           <button className="ghost" onClick={onLogout}>
             退出
           </button>
         </nav>
       </header>
 
-      <div className="layout">
-        <aside>
-          <div className="aside-head">
-            <span>访谈录音</span>
-            <label className={`upload ${busy ? 'disabled' : ''}`}>
-              + 上传录音
-              <input
-                ref={fileInput}
-                type="file"
-                accept="audio/*,.m4a,.flac,.aac,.ogg,.opus"
-                onChange={upload}
-                disabled={busy || !workspace}
-              />
-            </label>
-          </div>
-          {busy && <div className="progress">正在上传，请勿关闭页面...</div>}
-          {error && <div className="error sidebar-error">{error}</div>}
-          {loading && <p className="empty">正在加载工作区...</p>}
-          {!loading &&
-            recordings.map((recording) => (
-              <button
-                key={recording.id}
-                type="button"
-                className={`recording ${selectedId === recording.id ? 'active' : ''}`}
-                onClick={() => setSelectedId(recording.id)}
-              >
-                <span className="play">▶</span>
-                <span>
-                  <b>{recording.title}</b>
-                  <small>
-                    {recording.status === 'READY'
-                      ? '可编辑'
-                      : recording.status === 'FAILED'
-                        ? '处理失败'
-                        : '处理中'}{' '}
-                    · {recording._count?.clips || 0} 个片段
-                  </small>
-                </span>
-              </button>
-            ))}
-          {!loading && !recordings.length && !busy && (
-            <p className="empty">上传一段访谈录音开始整理。</p>
-          )}
-        </aside>
-
-        <section className="content">
-          {selected ? (
-            <Editor
-              key={selected.id}
-              recording={selected}
-              clips={clips}
-              setClips={setClips}
-            />
-          ) : (
-            <div className="welcome">
-              <div className="wave decorative">〰 〰 〰</div>
-              <h2>从一段声音开始</h2>
-              <p>选择左侧录音，在时间轴上标记片段并整理内容。</p>
+      {view === 'chapters' && workspace ? (
+        <ChaptersView workspaceId={workspace.id} />
+      ) : (
+        <div className="layout">
+          <aside>
+            <div className="aside-head">
+              <span>访谈录音</span>
+              <label className={`upload ${busy ? 'disabled' : ''}`}>
+                + 上传录音
+                <input
+                  ref={fileInput}
+                  type="file"
+                  accept="audio/*,.m4a,.flac,.aac,.ogg,.opus"
+                  onChange={upload}
+                  disabled={busy || !workspace}
+                />
+              </label>
             </div>
-          )}
-        </section>
-      </div>
+            {busy && <div className="progress">正在上传，请勿关闭页面...</div>}
+            {error && <div className="error sidebar-error">{error}</div>}
+            {loading && <p className="empty">正在加载工作区...</p>}
+            {!loading &&
+              recordings.map((recording) => (
+                <button
+                  key={recording.id}
+                  type="button"
+                  className={`recording ${selectedId === recording.id ? 'active' : ''}`}
+                  onClick={() => setSelectedId(recording.id)}
+                >
+                  <span className="play">▶</span>
+                  <span>
+                    <b>{recording.title}</b>
+                    <small>
+                      {recording.status === 'READY'
+                        ? '可编辑'
+                        : recording.status === 'FAILED'
+                          ? '处理失败'
+                          : '处理中'}{' '}
+                      · {recording._count?.clips || 0} 个片段
+                    </small>
+                    <small className="consent-line">
+                      {recording.latestConsent ? (
+                        <ConsentStateBadge state={recording.latestConsent.state} />
+                      ) : (
+                        <em className="consent-none">未登记授权</em>
+                      )}
+                      {recording.latestConsent
+                        ? ` · ${recording.latestConsent.intervieweeName}`
+                        : ''}
+                    </small>
+                  </span>
+                </button>
+              ))}
+            {!loading && !recordings.length && !busy && (
+              <p className="empty">上传一段访谈录音开始整理。</p>
+            )}
+          </aside>
+
+          <section className="content">
+            {selected ? (
+              <Editor
+                key={selected.id}
+                recording={selected}
+                clips={clips}
+                setClips={setClips}
+                onConsentChanged={loadRecordings}
+              />
+            ) : (
+              <div className="welcome">
+                <div className="wave decorative">〰 〰 〰</div>
+                <h2>从一段声音开始</h2>
+                <p>选择左侧录音，在时间轴上标记片段并整理内容。</p>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -401,10 +517,12 @@ function Editor({
   recording,
   clips,
   setClips,
+  onConsentChanged,
 }: {
   recording: Recording;
   clips: Clip[];
   setClips: React.Dispatch<React.SetStateAction<Clip[]>>;
+  onConsentChanged: () => Promise<void> | void;
 }) {
   const audio = useRef<HTMLAudioElement>(null);
   const playbackEnd = useRef<number | null>(null);
@@ -661,6 +779,668 @@ function Editor({
           </div>
         ))}
         {!clips.length && <p className="empty clip-empty">还没有片段。</p>}
+      </div>
+
+      <ConsentManager recordingId={recording.id} onChanged={onConsentChanged} />
+    </div>
+  );
+}
+
+function ConsentStateBadge({ state }: { state: ConsentState }) {
+  const text =
+    state === 'ACTIVE' ? '授权有效' : state === 'WITHDRAWN' ? '已撤回' : '已到期';
+  return (
+    <span className={`consent-badge ${state.toLowerCase()}`} title={`授权状态：${text}`}>
+      {text}
+    </span>
+  );
+}
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+type ConsentDraft = {
+  intervieweeName: string;
+  intervieweeContact: string;
+  grantedAt: string;
+  expiresOn: string;
+  usages: string[];
+  channels: string[];
+  requiresAnonymization: boolean;
+  restrictions: string;
+  notes: string;
+};
+
+function todayText() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function emptyDraft(): ConsentDraft {
+  return {
+    intervieweeName: '',
+    intervieweeContact: '',
+    grantedAt: todayText(),
+    expiresOn: '',
+    usages: ['TRANSCRIPTION', 'PUBLICATION'],
+    channels: ['WEB'],
+    requiresAnonymization: false,
+    restrictions: '',
+    notes: '',
+  };
+}
+
+function ConsentManager({
+  recordingId,
+  onChanged,
+}: {
+  recordingId: string;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [consents, setConsents] = useState<Consent[] | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  const [draft, setDraft] = useState<ConsentDraft>(emptyDraft);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [events, setEvents] = useState<Record<string, ConsentEvent[]>>({});
+  const [withdrawId, setWithdrawId] = useState<string | null>(null);
+  const [withdrawReason, setWithdrawReason] = useState('');
+
+  const load = useCallback(async () => {
+    const rows = await api<Consent[]>(`/v1/recordings/${recordingId}/consents`);
+    setConsents(rows);
+  }, [recordingId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void load()
+      .then(() => onChanged())
+      .catch((loadError) => {
+        if (!cancelled) setError((loadError as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [load, onChanged]);
+
+  const toggleIn = (list: string[], value: string) =>
+    list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+
+  const submit = async () => {
+    const name = draft.intervieweeName.trim();
+    if (!name) {
+      setError('请填写受访人姓名');
+      return;
+    }
+    if (!draft.grantedAt) {
+      setError('请选择授权日期');
+      return;
+    }
+    if (draft.expiresOn && draft.expiresOn < draft.grantedAt) {
+      setError('授权到期日不能早于授权日');
+      return;
+    }
+    if (draft.usages.length === 0) {
+      setError('至少选择一个授权用途');
+      return;
+    }
+    if (draft.channels.length === 0) {
+      setError('至少选择一个发布渠道');
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    try {
+      await api<Consent>(`/v1/recordings/${recordingId}/consents`, {
+        method: 'POST',
+        body: JSON.stringify({
+          intervieweeName: name,
+          intervieweeContact: draft.intervieweeContact.trim(),
+          grantedAt: draft.grantedAt,
+          expiresOn: draft.expiresOn || null,
+          scope: {
+            usages: draft.usages,
+            channels: draft.channels,
+            requiresAnonymization: draft.requiresAnonymization,
+            restrictions: draft.restrictions.trim(),
+          },
+          notes: draft.notes.trim(),
+        }),
+      });
+      setShowForm(false);
+      setDraft(emptyDraft());
+      await load();
+      await onChanged();
+    } catch (submitError) {
+      setError((submitError as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const withdraw = async (consentId: string) => {
+    const reason = withdrawReason.trim();
+    if (!reason) {
+      setError('请填写撤回原因（撤回原因将作为法定留痕保存）');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      await api<Consent>(`/v1/consents/${consentId}/withdraw`, {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      });
+      setWithdrawId(null);
+      setWithdrawReason('');
+      await load();
+      await onChanged();
+    } catch (withdrawError) {
+      setError((withdrawError as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleHistory = async (consentId: string) => {
+    if (expandedId === consentId) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(consentId);
+    if (!events[consentId]) {
+      try {
+        const rows = await api<ConsentEvent[]>(`/v1/consents/${consentId}/events`);
+        setEvents((current) => ({ ...current, [consentId]: rows }));
+      } catch (historyError) {
+        setError((historyError as Error).message);
+      }
+    }
+  };
+
+  return (
+    <div className="consent-panel">
+      <div className="section-title consent-head">
+        <span>
+          访谈授权登记 <span>{consents?.length ?? 0}</span>
+        </span>
+        {!showForm && (
+          <button
+            type="button"
+            className="small-btn"
+            onClick={() => {
+              setError('');
+              setShowForm(true);
+            }}
+          >
+            + 登记授权
+          </button>
+        )}
+      </div>
+
+      <div className="consent-body">
+        <p className="consent-legal-note">
+          撤回授权后将阻止相关章节发布，但授权记录、撤回原因与历史章节均依法保留留痕，不可删除。
+        </p>
+
+        {error && <div className="error">{error}</div>}
+
+        {showForm && (
+          <div className="consent-form">
+            <div className="form-grid">
+              <label>
+                受访人姓名 *
+                <input
+                  value={draft.intervieweeName}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      intervieweeName: event.target.value,
+                    }))
+                  }
+                  placeholder="例如：王秀英"
+                />
+              </label>
+              <label>
+                联系方式
+                <input
+                  value={draft.intervieweeContact}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      intervieweeContact: event.target.value,
+                    }))
+                  }
+                  placeholder="电话 / 微信 / 地址（可选）"
+                />
+              </label>
+              <label>
+                授权日期 *
+                <input
+                  type="date"
+                  value={draft.grantedAt}
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, grantedAt: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                授权到期日
+                <input
+                  type="date"
+                  value={draft.expiresOn}
+                  min={draft.grantedAt}
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, expiresOn: event.target.value }))
+                  }
+                />
+              </label>
+            </div>
+            <small className="field-hint">到期日留空表示长期授权（直至书面撤回）。</small>
+
+            <fieldset className="check-group">
+              <legend>授权用途 *（需勾选“公开发表”才能发布章节）</legend>
+              {ALL_USAGES.map((usage) => (
+                <label key={usage} className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.usages.includes(usage)}
+                    onChange={() =>
+                      setDraft((current) => ({
+                        ...current,
+                        usages: toggleIn(current.usages, usage),
+                      }))
+                    }
+                  />
+                  {USAGE_LABELS[usage]}
+                </label>
+              ))}
+            </fieldset>
+
+            <fieldset className="check-group">
+              <legend>授权发布渠道 *</legend>
+              {ALL_CHANNELS.map((channel) => (
+                <label key={channel} className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.channels.includes(channel)}
+                    onChange={() =>
+                      setDraft((current) => ({
+                        ...current,
+                        channels: toggleIn(current.channels, channel),
+                      }))
+                    }
+                  />
+                  {CHANNEL_LABELS[channel]}
+                </label>
+              ))}
+            </fieldset>
+
+            <label className="check anonym">
+              <input
+                type="checkbox"
+                checked={draft.requiresAnonymization}
+                onChange={(event) =>
+                  setDraft((current) => ({
+                    ...current,
+                    requiresAnonymization: event.target.checked,
+                  }))
+                }
+              />
+              要求发布前进行匿名化处理
+            </label>
+
+            <label className="stacked">
+              其他限制条件
+              <textarea
+                rows={2}
+                value={draft.restrictions}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, restrictions: event.target.value }))
+                }
+                placeholder="如：隐去具体地名 / 仅限家族内部 / 不得用于商业用途"
+              />
+            </label>
+            <label className="stacked">
+              备注
+              <textarea
+                rows={2}
+                value={draft.notes}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, notes: event.target.value }))
+                }
+                placeholder="见证人、授权书编号等（可选）"
+              />
+            </label>
+
+            <div className="form-actions">
+              <button
+                type="button"
+                onClick={submit}
+                disabled={busy}
+                className="primary"
+              >
+                {busy ? '保存中...' : '保存授权登记'}
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy}
+                onClick={() => {
+                  setShowForm(false);
+                  setError('');
+                }}
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {consents && consents.length === 0 && !showForm && (
+          <p className="empty">尚未登记访谈授权。未授权的录音不得用于章节发布。</p>
+        )}
+
+        {consents?.map((consent) => (
+          <div
+            key={consent.id}
+            className={`consent-card ${consent.state.toLowerCase()}`}
+          >
+            <div className="consent-card-head">
+              <div>
+                <b>{consent.intervieweeName}</b>
+                <small>
+                  授权 {consent.grantedAt}
+                  {consent.expiresOn ? ` 至 ${consent.expiresOn}` : ' · 长期有效'}
+                  {consent.intervieweeContact ? ` · ${consent.intervieweeContact}` : ''}
+                </small>
+              </div>
+              <ConsentStateBadge state={consent.state} />
+            </div>
+
+            <div className="consent-tags">
+              {consent.scopeJson.usages.map((usage) => (
+                <span key={usage} className="tag">
+                  {USAGE_LABELS[usage] || usage}
+                </span>
+              ))}
+              {consent.scopeJson.channels.map((channel) => (
+                <span key={channel} className="tag channel">
+                  {CHANNEL_LABELS[channel] || channel}
+                </span>
+              ))}
+              {consent.scopeJson.requiresAnonymization && (
+                <span className="tag warn">需匿名化</span>
+              )}
+            </div>
+            {consent.scopeJson.restrictions && (
+              <p className="consent-restrictions">限制：{consent.scopeJson.restrictions}</p>
+            )}
+            {consent.notes && <p className="consent-restrictions">备注：{consent.notes}</p>}
+
+            {consent.state === 'WITHDRAWN' && (
+              <div className="withdraw-record">
+                <strong>授权已撤回（记录依法保留）</strong>
+                <small>
+                  {consent.withdrawnAt ? formatDateTime(consent.withdrawnAt) : ''}
+                  {consent.withdrawReason ? ` · 原因：${consent.withdrawReason}` : ''}
+                </small>
+              </div>
+            )}
+
+            {withdrawId === consent.id && (
+              <div className="withdraw-form">
+                <label className="stacked">
+                  撤回原因 *
+                  <textarea
+                    rows={2}
+                    value={withdrawReason}
+                    onChange={(event) => setWithdrawReason(event.target.value)}
+                    placeholder="将随撤回事件永久留痕，例如：受访人口头要求撤回全部公开发表授权"
+                  />
+                </label>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={busy}
+                    onClick={() => withdraw(consent.id)}
+                  >
+                    确认撤回
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy}
+                    onClick={() => {
+                      setWithdrawId(null);
+                      setWithdrawReason('');
+                    }}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="consent-card-actions">
+              {consent.state === 'ACTIVE' && withdrawId !== consent.id && (
+                <button
+                  type="button"
+                  className="link-danger"
+                  disabled={busy}
+                  onClick={() => {
+                    setError('');
+                    setWithdrawId(consent.id);
+                  }}
+                >
+                  撤回授权
+                </button>
+              )}
+              <button
+                type="button"
+                className="link"
+                onClick={() => toggleHistory(consent.id)}
+              >
+                {expandedId === consent.id ? '隐藏留痕记录' : '查看留痕记录'}
+              </button>
+            </div>
+
+            {expandedId === consent.id && (
+              <ol className="event-log">
+                {(events[consent.id] || []).map((event) => (
+                  <li key={event.id}>
+                    <span className={`event-type ${event.type.toLowerCase()}`}>
+                      {event.type === 'GRANTED'
+                        ? '登记'
+                        : event.type === 'UPDATED'
+                          ? '变更'
+                          : '撤回'}
+                    </span>
+                    <time>{formatDateTime(event.createdAt)}</time>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RiskBanner({ risk }: { risk: ConsentRisk }) {
+  if (risk.level === 'ok') return null;
+  return (
+    <div className={`risk-banner ${risk.level}`} role="alert">
+      <strong>
+        {risk.level === 'blocked' ? '⚠ 授权风险：禁止发布' : '⚠ 授权提醒'}
+      </strong>
+      <span>{risk.message}</span>
+      {risk.recordings.some((item) => item.level !== 'ok') && (
+        <ul className="risk-recordings">
+          {risk.recordings
+            .filter((item) => item.level !== 'ok')
+            .map((item) => (
+              <li key={item.recordingId}>
+                《{item.recordingTitle}》：{item.message}
+              </li>
+            ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ChaptersView({ workspaceId }: { workspaceId: string }) {
+  const [chapters, setChapters] = useState<Chapter[] | null>(null);
+  const [error, setError] = useState('');
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [channels, setChannels] = useState<Record<string, string>>({});
+
+  const load = useCallback(async () => {
+    const rows = await api<Chapter[]>(`/v1/workspaces/${workspaceId}/chapters`);
+    setChapters(rows);
+  }, [workspaceId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void load().catch((loadError) => {
+      if (!cancelled) setError((loadError as Error).message);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [load]);
+
+  const createChapter = async () => {
+    setError('');
+    const title = window.prompt('新章节标题');
+    if (!title?.trim()) return;
+    try {
+      const created = await api<Chapter>(`/v1/workspaces/${workspaceId}/chapters`, {
+        method: 'POST',
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      setChapters((current) => [
+        {
+          ...created,
+          blocks: [],
+          consentRisk: {
+            level: 'ok',
+            reasonCode: 'OK',
+            message: '',
+            recordings: [],
+          },
+        },
+        ...(current || []),
+      ]);
+      await load();
+    } catch (createError) {
+      setError((createError as Error).message);
+    }
+  };
+
+  const publish = async (chapter: Chapter) => {
+    setError('');
+    setBusyId(chapter.id);
+    try {
+      await api(`/v1/chapters/${chapter.id}/publish`, {
+        method: 'POST',
+        body: JSON.stringify(
+          channels[chapter.id] ? { channel: channels[chapter.id] } : {},
+        ),
+      });
+      await load();
+    } catch (publishError) {
+      setError((publishError as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="chapters-view">
+      <div className="chapters-toolbar">
+        <h2>章节与发布</h2>
+        <button type="button" className="small-btn primary" onClick={createChapter}>
+          + 新建章节
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {chapters?.length === 0 && (
+        <p className="empty">还没有章节。新建章节并添加内容块后即可申请发布。</p>
+      )}
+      <div className="chapter-list">
+        {chapters?.map((chapter) => (
+          <article key={chapter.id} className="chapter-card">
+            <div className="chapter-card-head">
+              <div>
+                <h3>{chapter.title}</h3>
+                <small>
+                  {chapter.status === 'PUBLISHED' ? '已发布' : '草稿'} ·{' '}
+                  {chapter.blocks.length} 个内容块 · 更新于{' '}
+                  {formatDateTime(chapter.updatedAt)}
+                </small>
+              </div>
+              <span
+                className={`chapter-status ${chapter.status === 'PUBLISHED' ? 'published' : 'draft'}`}
+              >
+                {chapter.status === 'PUBLISHED' ? '已发布' : '草稿'}
+              </span>
+            </div>
+
+            <RiskBanner risk={chapter.consentRisk} />
+
+            {chapter.status === 'PUBLISHED' &&
+              chapter.consentRisk.level === 'blocked' && (
+                <p className="legal-retention-note">
+                  该章节发布后授权状态发生变化。历史章节与留痕依法保留、不予删除，但已不符合继续发布条件，请尽快下架或脱敏处理。
+                </p>
+              )}
+
+            <div className="publish-row">
+              <label className="channel-pick">
+                发布渠道
+                <select
+                  value={channels[chapter.id] || ''}
+                  onChange={(event) =>
+                    setChannels((current) => ({
+                      ...current,
+                      [chapter.id]: event.target.value,
+                    }))
+                  }
+                >
+                  <option value="">不指定（仅校验公开发表用途）</option>
+                  {ALL_CHANNELS.map((channel) => (
+                    <option key={channel} value={channel}>
+                      {CHANNEL_LABELS[channel]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="primary"
+                disabled={busyId === chapter.id || chapter.consentRisk.level === 'blocked'}
+                title={
+                  chapter.consentRisk.level === 'blocked'
+                    ? '授权未覆盖发布范围，已被阻止'
+                    : undefined
+                }
+                onClick={() => publish(chapter)}
+              >
+                {busyId === chapter.id
+                  ? '校验中...'
+                  : chapter.status === 'PUBLISHED'
+                    ? '重新发布'
+                    : '发布章节'}
+              </button>
+            </div>
+          </article>
+        ))}
       </div>
     </div>
   );

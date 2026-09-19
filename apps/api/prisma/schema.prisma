@@ -26,6 +26,17 @@ enum ChapterStatus {
   PUBLISHED
 }
 
+enum RecordingConsentStatus {
+  ACTIVE
+  WITHDRAWN
+}
+
+enum RecordingConsentEventType {
+  GRANTED
+  UPDATED
+  WITHDRAWN
+}
+
 model User {
   id                String               @id @default(uuid())
   email             String               @unique
@@ -40,6 +51,9 @@ model User {
   clipsUpdated      Clip[]               @relation("ClipUpdatedBy")
   chapters          Chapter[]
   collaborationEvents CollaborationEvent[]
+  consents          RecordingConsent[]       @relation("ConsentCreatedBy")
+  consentsWithdrawn RecordingConsent[]       @relation("ConsentWithdrawnBy")
+  consentEvents     RecordingConsentEvent[]
 }
 
 model Workspace {
@@ -57,6 +71,8 @@ model Workspace {
   clips      Clip[]
   chapters   Chapter[]
   events     CollaborationEvent[]
+  consents   RecordingConsent[]
+  consentEvents RecordingConsentEvent[]
 
   @@index([ownerId])
 }
@@ -92,6 +108,7 @@ model Recording {
   workspace       Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   createdBy       User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
   clips           Clip[]
+  consents        RecordingConsent[]
 
   @@index([workspaceId, updatedAt])
   @@index([createdById])
@@ -109,6 +126,55 @@ model Person {
   clips       Clip[]
 
   @@index([workspaceId, name])
+}
+
+/// 访谈授权登记：记录受访人对一段录音的授权范围与期限。
+/// 撤回后记录本身保留（法定留痕），仅状态变更为 WITHDRAWN，不允许物理删除。
+model RecordingConsent {
+  id                 String                   @id @default(uuid())
+  workspaceId        String
+  recordingId        String
+  intervieweeName    String
+  intervieweeContact String                   @default("")
+  grantedAt          DateTime
+  expiresOn          DateTime?
+  scopeJson          Json
+  notes              String                   @default("")
+  status             RecordingConsentStatus   @default(ACTIVE)
+  withdrawnAt        DateTime?
+  withdrawReason     String?
+  withdrawnById      String?
+  version            Int                      @default(1)
+  createdById        String
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  workspace          Workspace                @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  recording          Recording                @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  createdBy          User                     @relation("ConsentCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  withdrawnBy        User?                    @relation("ConsentWithdrawnBy", fields: [withdrawnById], references: [id], onDelete: Restrict)
+  events             RecordingConsentEvent[]
+
+  @@index([recordingId, createdAt])
+  @@index([workspaceId, status])
+}
+
+/// 授权操作留痕：登记、变更、撤回均追加不可修改/删除的事件，作为法定留痕。
+model RecordingConsentEvent {
+  id          String                     @id @default(uuid())
+  workspaceId String
+  consentId   String
+  recordingId String
+  actorId     String
+  type        RecordingConsentEventType
+  detailJson  Json
+  createdAt   DateTime                   @default(now())
+  workspace   Workspace                  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  consent     RecordingConsent           @relation(fields: [consentId], references: [id], onDelete: Cascade)
+  actor       User                       @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([consentId, createdAt])
+  @@index([recordingId, createdAt])
+  @@index([workspaceId, createdAt])
 }
 
 model Clip {
